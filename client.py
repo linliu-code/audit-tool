@@ -44,9 +44,53 @@ class SparkUIClient:
         """All stages with summary metrics."""
         return self._get("/stages")
 
-    def get_stage_attempt(self, stage_id: int, attempt_id: int = 0) -> Dict:
-        """Stage with full task list + accumulables."""
-        return self._get(f"/stages/{stage_id}/{attempt_id}")
+    def get_stage_attempt(
+        self,
+        stage_id: int,
+        attempt_id: int = 0,
+        with_summaries: bool = False,
+        quantiles: Optional[List[float]] = None,
+    ) -> Dict:
+        """Stage with full task list + accumulables.
+
+        Spark's per-stage endpoint only populates `taskMetricsDistributions`
+        when `withSummaries=true` is set, and only the per-stage endpoint —
+        NOT the `/stages` list endpoint — supports it. Pass with_summaries=True
+        when you need quantile distributions.
+
+        With Spark 3.4+, you can request specific quantiles via the `quantiles`
+        parameter (e.g. [0.0, 0.5, 0.95, 0.99, 1.0]); the default
+        [0.0, 0.25, 0.5, 0.75, 1.0] is returned otherwise.
+        """
+        params = []
+        if with_summaries:
+            params.append("withSummaries=true")
+        if quantiles is not None:
+            params.append("quantiles=" + ",".join(str(q) for q in quantiles))
+        suffix = ("?" + "&".join(params)) if params else ""
+        return self._get(f"/stages/{stage_id}/{attempt_id}{suffix}")
+
+    def get_stage_distributions(
+        self,
+        stage_id: int,
+        attempt_id: int = 0,
+        quantiles: Optional[List[float]] = None,
+    ) -> Optional[Dict]:
+        """Return just the `taskMetricsDistributions` dict for a stage, or
+        None if the stage has none (e.g. it had zero tasks).
+
+        Use this when you only need quantile distributions and not the full
+        task list — saves bandwidth vs. get_stage_attempt(with_summaries=True).
+        """
+        if quantiles is None:
+            quantiles = [0.0, 0.5, 0.95, 0.99, 1.0]
+        try:
+            stage = self.get_stage_attempt(
+                stage_id, attempt_id, with_summaries=True, quantiles=quantiles
+            )
+        except Exception:
+            return None
+        return stage.get("taskMetricsDistributions")
 
     def get_executors(self) -> List[Dict]:
         return self._get("/executors")

@@ -74,21 +74,52 @@ class StageContext:
 
     @property
     def task_duration_p99_ms(self) -> int:
-        """Approximate p99 task duration from the summary if available."""
-        # statusTracker provides this; if absent, fall back to executor time
-        summary = self.stage.get("taskMetricsDistributions") or {}
-        durations = summary.get("executorRunTime") or []
-        if durations and len(durations) >= 9:
-            return int(durations[8])  # quantile index for p99
-        return self.duration_ms
+        v = self._task_metric_quantile("executorRunTime", 0.99)
+        return v if v is not None else self._avg_task_duration_ms()
 
     @property
     def task_duration_median_ms(self) -> int:
+        v = self._task_metric_quantile("executorRunTime", 0.5)
+        return v if v is not None else self._avg_task_duration_ms()
+
+    def _task_metric_quantile(self, metric: str, quantile: float) -> Optional[int]:
+        """Look up a quantile of a per-task metric by VALUE (not array index).
+
+        Spark's `taskMetricsDistributions` returns a `quantiles` array (e.g.
+        [0.0, 0.25, 0.5, 0.75, 1.0] by default, or [0.0, 0.5, 0.95, 0.99, 1.0]
+        if the client requested those explicitly) paired with same-length
+        per-metric value arrays. The previous implementation hard-coded array
+        indices (assumed 9 quantiles, got 5) and silently fell back to a wrong
+        value, producing 1000x+ false skew findings. This version finds the
+        index whose quantile value is closest to the requested one, with a
+        small tolerance.
+
+        Returns None if distributions are not populated (most commonly: the
+        stage was fetched via the /stages list endpoint which does not
+        include taskMetricsDistributions). Caller can populate them by
+        calling SparkUIClient.get_stage_distributions() and merging into
+        self.stage under the "taskMetricsDistributions" key.
+        """
         summary = self.stage.get("taskMetricsDistributions") or {}
-        durations = summary.get("executorRunTime") or []
-        if durations and len(durations) >= 5:
-            return int(durations[4])
-        return self.duration_ms // max(self.num_tasks, 1)
+        quantiles = summary.get("quantiles") or []
+        values = summary.get(metric) or []
+        if not quantiles or len(quantiles) != len(values):
+            return None
+        idx = min(range(len(quantiles)), key=lambda i: abs(quantiles[i] - quantile))
+        # Tolerance: only accept if the requested quantile is close to an
+        # available one. Keeps p99 from silently degrading to max or p75.
+        if abs(quantiles[idx] - quantile) > 0.05:
+            return None
+        return int(values[idx])
+
+    def _avg_task_duration_ms(self) -> int:
+        """Fallback when distributions are unavailable: average per-task time.
+        Returns the same value for p99 and median, so skew_ratio == 1.0 and
+        the task_skew rule does not fire on stages with missing distribution
+        data (correct false-negative rather than the prior 1000x false-positive)."""
+        if self.num_tasks > 0:
+            return self.duration_ms // self.num_tasks
+        return self.duration_ms
 
     @property
     def hudi_phase(self) -> str:
@@ -163,11 +194,22 @@ def build_stage_contexts(
     hudi_table_config: Optional[Dict] = None,
     hudi_version: Optional[str] = None,
     sql_executions: Optional[List[Dict]] = None,
+    spark_client=None,
+    min_tasks_for_distributions: int = 3,
+    min_executor_run_time_ms_for_distributions: int = 500,
 ) -> List[StageContext]:
     """Build a StageContext per stage. Cross-links SQL plan nodes when possible.
 
     SQL plan cross-linking: each SQL execution has a stage list; we match by
     job ID. For v1 we do a simple lookup by stage ID across all SQL execs.
+
+    If `spark_client` is provided, this also fetches per-stage
+    `taskMetricsDistributions` for stages large enough to benefit
+    (numTasks >= min_tasks_for_distributions and executorRunTime >=
+    min_executor_run_time_ms_for_distributions), and merges them into the
+    stage dict. This is required for the `task_skew` rule and any other
+    quantile-based rule to produce correct findings, because the /stages list
+    endpoint does NOT return distributions.
     """
     sql_node_by_stage_id: Dict[int, Dict] = {}
     if sql_executions:
@@ -177,6 +219,24 @@ def build_stage_contexts(
                 # metrics. Stage IDs are not directly in nodes; we'd need to
                 # parse the plan more deeply. v1 punt: leave empty.
                 pass
+
+    # Augment stages with taskMetricsDistributions when the caller gave us
+    # a client. We mutate each stage dict in place by adding the key.
+    if spark_client is not None:
+        for s in stages:
+            if "taskMetricsDistributions" in s:
+                continue  # already populated
+            if s.get("numTasks", 0) < min_tasks_for_distributions:
+                continue
+            if s.get("executorRunTime", 0) < min_executor_run_time_ms_for_distributions:
+                continue
+            stage_id = s.get("stageId")
+            attempt_id = s.get("attemptId", 0)
+            if stage_id is None:
+                continue
+            dist = spark_client.get_stage_distributions(stage_id, attempt_id)
+            if dist:
+                s["taskMetricsDistributions"] = dist
 
     return [
         StageContext(

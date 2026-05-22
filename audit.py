@@ -104,6 +104,7 @@ def run_audit(args) -> int:
             hudi_table_config=hudi_table_config,
             hudi_version=hudi_version,
             sql_executions=sql_executions,
+            spark_client=client,
         )
 
         findings: List[Finding] = []
