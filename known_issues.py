@@ -149,6 +149,65 @@ KNOWN_ISSUES = {
         ),
     },
 
+    "table-service-plan-per-partition-metadata-fetch": {
+        "title": (
+            "Compaction / clustering plan generators dispatch one Spark task per "
+            "partition, each doing a SINGULAR metadata-table fetch — should use "
+            "the batched API once on the driver"
+        ),
+        "upstream": "internal (H-tsp-#1, pending filing)",
+        "affected_versions": "all 0.15.x through master HEAD",
+        "severity": "high",
+        "description": (
+            "BaseHoodieCompactionPlanGenerator.generateCompactionPlan uses "
+            "engineContext.flatMap(partitionPaths, ...) to parallelize "
+            "per-partition file listing. The lambda calls "
+            "fileSystemView.getLatestFileSlicesStateless(partition), which "
+            "delegates to AbstractTableFileSystemView.getAllFilesInPartition "
+            "→ tableMetadata.getAllFilesInPartition(path) — the SINGULAR API.\n"
+            "\n"
+            "Each Spark task therefore performs an independent metadata round "
+            "trip: opens its own MDT files-partition HFile reader (S3 GET for "
+            "the footer/index block), seeks + reads the data block containing "
+            "the partition's key (S3 GET), and deserializes the FileStatus[] "
+            "payload. The post-fetch CPU work (build file groups, filter, "
+            "construct CompactionOperation) is sub-millisecond per partition.\n"
+            "\n"
+            "Stage signature in Spark UI:\n"
+            "  - call stack mentions BaseHoodieCompactionPlanGenerator\n"
+            "    .generateCompactionPlan and HoodieSparkEngineContext.flatMap\n"
+            "  - numTasks == number of partitions\n"
+            "  - executorRunTime sum is N × ~100ms; executorCpuTime sum is\n"
+            "    tiny (CPU efficiency < 1%)\n"
+            "  - inputBytes / outputBytes / shuffleReadBytes all zero (the\n"
+            "    metadata reads are S3 GETs, not Spark-tracked I/O)\n"
+            "\n"
+            "The batched plural API "
+            "HoodieTableMetadata.getAllFilesInPartitions(Collection<String>) "
+            "already exists at the same metadata layer "
+            "(BaseTableMetadata.java line ~153; HoodieBackedTableMetadata."
+            "fetchAllFilesInPartitionPaths does ONE getRecordsByKeys range "
+            "scan against the MDT files-partition for all keys). It is used "
+            "by BaseHoodieTableFileIndex, but not by the compaction-plan or "
+            "clustering-plan generators.\n"
+            "\n"
+            "Impact scales with partition count. For a 2070-partition MoR "
+            "table observed in production, this stage took ~33 s of wall "
+            "time at < 0.5% CPU efficiency, fired every few minutes via the "
+            "compaction schedule. The expected post-fix wall time is in the "
+            "1-2 s range (one batched MDT read + driver-side iteration)."
+        ),
+        "recommendation": (
+            "Pre-warm the FileSystemView's per-partition cache with a single "
+            "batched call to tableMetadata.getAllFilesInPartitions(partitionPaths) "
+            "BEFORE iterating, then iterate driver-side (NOT via engineContext."
+            "flatMap, since closure-serialized executor copies of the view "
+            "have empty caches and would re-issue per-partition metadata "
+            "fetches anyway). The same fix applies to clustering-plan "
+            "generation in ClusteringPlanStrategy."
+        ),
+    },
+
     "r2-file-size-bloat": {
         "title": "Per-file metadata bloat — Hudi files carry ~440 KB extra per file",
         "upstream": "W-r2-#3 (no upstream filing; structural)",

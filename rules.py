@@ -250,6 +250,71 @@ def rule_fetch_wait_dominates(ctx: StageContext) -> Optional[Finding]:
     )
 
 
+def rule_table_service_plan_per_partition_metadata_fetch(ctx: StageContext) -> Optional[Finding]:
+    """Table-service planning (compaction / clustering) dispatched one Spark
+    task per partition, with each task calling the singular metadata-table
+    listing API. Every task does ~2 S3 GETs against the metadata HFile and
+    near-zero CPU work; the batched plural API would collapse N round trips
+    into 1.
+
+    Signature:
+      - stage is a compaction-plan or clustering-plan flatMap (via hudi_phase)
+      - numTasks is large (typically equals partition count)
+      - CPU efficiency is very low (waiting on S3 GETs, not computing)
+      - Spark-accounted I/O is zero (the metadata reads don't register as
+        Spark inputBytes / shuffleReadBytes)
+      - per-task duration is small but adds up across many tasks
+
+    Tunables:
+      - MIN_TASKS: only fire for genuinely partition-heavy tables
+      - MAX_CPU_EFFICIENCY: 0.10 = stage was waiting >90% of executor time
+      - MIN_WALL_MS: don't fire on incidental short stages
+    """
+    MIN_TASKS = 50
+    MAX_CPU_EFFICIENCY = 0.10
+    MIN_WALL_MS = 2_000
+    if ctx.hudi_phase not in ("compactionPlan", "clusteringPlan"):
+        return None
+    if ctx.num_tasks < MIN_TASKS:
+        return None
+    if ctx.duration_ms < MIN_WALL_MS:
+        return None
+    if ctx.has_any_io_bytes:
+        return None
+    if ctx.cpu_efficiency >= MAX_CPU_EFFICIENCY:
+        return None
+    return Finding(
+        rule_id="table_service_plan_per_partition_metadata_fetch",
+        severity="high",
+        stage_id=ctx.stage_id,
+        evidence={
+            "hudi_phase": ctx.hudi_phase,
+            "num_tasks": ctx.num_tasks,
+            "executor_run_time_ms": ctx.duration_ms,
+            "executor_cpu_time_ms": ctx.executor_cpu_time_ns // 1_000_000,
+            "cpu_efficiency": round(ctx.cpu_efficiency, 4),
+            "input_bytes": ctx.input_bytes,
+            "shuffle_read_bytes": ctx.shuffle_read_bytes,
+            "task_p99_ms": ctx.task_duration_p99_ms,
+            "task_median_ms": ctx.task_duration_median_ms,
+        },
+        linked_issue="table-service-plan-per-partition-metadata-fetch",
+        recommendation=(
+            "The compaction-plan / clustering-plan generator parallelizes one "
+            "Spark task per partition, and each task does its own singular "
+            "metadata-table listing call (~2 S3 GETs against the MDT files "
+            "partition HFile). The batched plural API "
+            "(HoodieTableMetadata.getAllFilesInPartitions) already exists and "
+            "would do one range read for all partitions; it just isn't used "
+            "by the plan generator. Fix: pre-load all partitions into the "
+            "FileSystemView cache via the batched API on the driver, then "
+            "iterate driver-side instead of via engineContext.flatMap (the "
+            "warmed cache lives on the driver only, so closure-serialized "
+            "executor copies would discard it)."
+        ),
+    )
+
+
 # ──────────────────────── Job-level rules (cross-stage) ───────────────────
 
 
@@ -389,6 +454,7 @@ STAGE_RULES: List[Callable[[StageContext], Optional[Finding]]] = [
     rule_shuffle_spill,
     rule_skew,
     rule_fetch_wait_dominates,
+    rule_table_service_plan_per_partition_metadata_fetch,
 ]
 
 JOB_RULES: List[Callable] = [

@@ -73,6 +73,46 @@ class StageContext:
         return self.stage.get("shuffleFetchWaitTime", 0)
 
     @property
+    def executor_cpu_time_ns(self) -> int:
+        """Sum of CPU time across all tasks of this stage. From Spark's
+        `executorCpuTime` field (nanoseconds). Use cpu_efficiency for the
+        ratio against wall executor time."""
+        return self.stage.get("executorCpuTime", 0)
+
+    @property
+    def cpu_efficiency(self) -> float:
+        """Fraction of executor wall time that was actual CPU work.
+        Returns 1.0 when there's no measurable executor time (avoids
+        divide-by-zero false-positives on trivially short stages).
+
+        Low values (<5-10%) typically indicate the stage is bottlenecked
+        on external I/O — most commonly S3 GETs to listing-style metadata
+        when the work itself is per-row trivial."""
+        if self.duration_ms <= 0:
+            return 1.0
+        return (self.executor_cpu_time_ns / 1_000_000) / self.duration_ms
+
+    @property
+    def details(self) -> str:
+        """Stage call-stack / details field from Spark UI. Multi-line string
+        with one frame per line; rules can match on class/method substrings
+        to identify which Hudi code path drove the stage."""
+        return self.stage.get("details", "") or ""
+
+    @property
+    def has_any_io_bytes(self) -> bool:
+        """True if the stage moved any bytes through Spark's accounted
+        I/O metrics (input, output, shuffle). False here is a strong hint
+        that the per-task work is purely metadata RPC / S3 GETs that don't
+        register as Spark I/O."""
+        return (
+            self.input_bytes > 0
+            or self.shuffle_read_bytes > 0
+            or self.shuffle_write_bytes > 0
+            or self.stage.get("outputBytes", 0) > 0
+        )
+
+    @property
     def task_duration_p99_ms(self) -> int:
         v = self._task_metric_quantile("executorRunTime", 0.99)
         return v if v is not None else self._avg_task_duration_ms()
@@ -126,7 +166,8 @@ class StageContext:
         """Heuristic classification of this stage's Hudi-attributable phase.
         Returns one of: 'tagLocation', 'fileGroupShuffle', 'baseFileWrite',
         'mdtWrite', 'mdtRliWrite', 'mdtColStatsWrite', 'mdtBloomWrite',
-        'workloadProfile', 'commit', 'mergeSourceJoin', 'unknown'."""
+        'workloadProfile', 'commit', 'mergeSourceJoin',
+        'compactionPlan', 'clusteringPlan', 'unknown'."""
         n = self.name.lower()
         if "taglocation" in n or "bloomindex" in n or "simpleindex" in n:
             return "tagLocation"
@@ -154,6 +195,14 @@ class StageContext:
             return "markerHandling"
         if "sortmergejoin" in n or "broadcasthashjoin" in n or "shuffledhashjoin" in n:
             return "mergeSourceJoin"
+        # The stage name for table-service-plan stages is generic
+        # ("collect at HoodieSparkEngineContext.java:..."); fall back to the
+        # stack `details` for plan-generator class names.
+        d = self.details
+        if "CompactionPlanGenerator" in d:
+            return "compactionPlan"
+        if "ClusteringPlanStrategy" in d or "ClusteringPlanActionExecutor" in d:
+            return "clusteringPlan"
         return "unknown"
 
     @property
