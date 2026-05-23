@@ -7,8 +7,9 @@ Both are read-only.
 """
 import json
 import os
+import re
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 # ────────────────────── Spark UI REST API ────────────────────────────────
@@ -175,18 +176,83 @@ class HudiMetaReader:
 # ────────────────────── Convenience ───────────────────────────────────────
 
 
+# Matches Hudi-bundle-shaped jar filenames and captures the version.
+# Examples:
+#   hudi-spark3.4-bundle_2.12-1.1.1.jar       -> "1.1.1"
+#   hudi-utilities-bundle_2.12-0.14.1.jar     -> "0.14.1"
+#   hudi-spark3.5_2.13-0.15.0-SNAPSHOT.jar    -> "0.15.0-SNAPSHOT"
+#   hudi-utilities-slim-bundle_2.12-1.0.0.jar -> "1.0.0"
+#
+# Non-greedy middle section: any combination of dashes, underscores, digits,
+# letters, and dots — but the version-suffix-then-.jar at the end is what
+# anchors the match.
+_HUDI_JAR_VERSION_RE = re.compile(
+    r"hudi[\w.-]*?-([0-9]+\.[0-9]+\.[0-9]+(?:[-_][A-Za-z0-9._]+)?)\.jar",
+    re.IGNORECASE,
+)
+
+
 def detect_hudi_version_from_env(env: Dict) -> Optional[str]:
-    """Look at Spark conf to find a Hudi bundle version, if registered."""
-    spark_props = env.get("sparkProperties", [])
-    for k, v in spark_props:
-        if "hudi" in k.lower() and "bundle" in v.lower():
-            return v
-        if k == "spark.jars" and "hudi-spark" in v:
-            # extract version from path like .../hudi-spark3.4-bundle_2.12-1.1.1.jar
-            for token in v.split(","):
-                if "hudi-spark" in token and ".jar" in token:
-                    base = os.path.basename(token)
-                    parts = base.replace(".jar", "").split("-")
-                    if len(parts) > 0:
-                        return parts[-1]  # version is last token
+    """Find the Hudi bundle jar in the Spark environment and return its version.
+
+    Checks (in order) every source Spark surfaces classpath info under:
+      1. sparkProperties — `spark.jars`, plus any key/value that mentions Hudi
+      2. classpathEntries — every classpath entry (typically the most reliable)
+      3. systemProperties — `java.class.path` and `sun.java.command`
+
+    Returns the version string of the first Hudi-bundle-style jar found,
+    capturing both the numeric `X.Y.Z` core and an optional qualifier
+    (`-SNAPSHOT`, `-rc1`, etc.), or None if no Hudi jar matched.
+
+    The old implementation only consulted sparkProperties and assumed the
+    jar's version was the last `-`-separated token after stripping `.jar` —
+    that mis-parsed common shapes like `hudi-spark3.4-bundle_2.12-1.1.1.jar`
+    (where the last token would be `1.1.1` but the regex anchor makes the
+    intent explicit and survives qualifier suffixes).
+    """
+    for path in _classpath_candidates(env):
+        m = _HUDI_JAR_VERSION_RE.search(path)
+        if m:
+            return m.group(1)
     return None
+
+
+def _classpath_candidates(env: Dict) -> Iterable[str]:
+    """Yield classpath-like strings from every source Spark exposes.
+
+    Generator so that callers can short-circuit on the first match without
+    materializing the entire list.
+    """
+    # 1. sparkProperties — comma-separated `spark.jars` list, or any value
+    #    that already mentions Hudi (e.g. a custom `hudi.bundle.version` key)
+    for k, v in env.get("sparkProperties", []) or []:
+        if not v:
+            continue
+        if k == "spark.jars" or "hudi" in (k or "").lower() or "hudi" in v.lower():
+            for token in v.split(","):
+                if token:
+                    yield token
+    # 2. classpathEntries — list of [path, source] tuples. This is usually
+    #    the place that has the individual jars enumerated, even when
+    #    spark.jars / java.class.path use wildcards like `/opt/spark/jars/*`.
+    for entry in env.get("classpathEntries", []) or []:
+        if isinstance(entry, (list, tuple)) and entry:
+            path = entry[0]
+            if isinstance(path, str):
+                yield path
+        elif isinstance(entry, str):
+            yield entry
+    # 3. systemProperties — `java.class.path` is the actual JVM classpath
+    #    (often a wildcard, in which case this yields nothing useful);
+    #    `sun.java.command` carries the original `java -cp ... MainClass`
+    #    command line, which on Spark can contain bundle paths.
+    for k, v in env.get("systemProperties", []) or []:
+        if not v:
+            continue
+        if k not in ("java.class.path", "sun.java.command"):
+            continue
+        # tolerate both Unix ':' and comma separators
+        for sep in (":", ","):
+            for part in v.split(sep):
+                if part:
+                    yield part
