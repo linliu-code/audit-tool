@@ -39,28 +39,37 @@ def rule_count_star_full_scan(ctx: StageContext) -> Optional[Finding]:
     if ctx.input_bytes < 1024 * 1024:
         return None
     # If we have a SQL node and it's a count aggregation, raise confidence
-    if ctx.sql_node and "count" in str(ctx.sql_node).lower():
-        # Compare bytes-per-record — count(*) should not read full rows
-        records = max(ctx.shuffle_read_records, 1)
-        bytes_per_record = ctx.input_bytes / records
-        if bytes_per_record > 1000:  # full row reads ~hundreds of bytes; footer reads <100
-            return Finding(
-                rule_id="count_star_full_scan",
-                severity="high",
-                stage_id=ctx.stage_id,
-                evidence={
-                    "input_bytes": ctx.input_bytes,
-                    "shuffle_read_records": records,
-                    "bytes_per_record": int(bytes_per_record),
-                    "note": "count(*) aggregation node observed in SQL plan",
-                },
-                linked_issue="hudi-18769-count-star",
-                recommendation=(
-                    "Watch apache/hudi#18770 for merge. Workaround: query raw "
-                    "parquet directly if this is performance-critical."
-                ),
-            )
-    return None
+    if not (ctx.sql_node and "count" in str(ctx.sql_node).lower()):
+        return None
+    # Compare bytes-per-record — count(*) should not read full rows
+    records = max(ctx.shuffle_read_records, 1)
+    bytes_per_record = ctx.input_bytes / records
+    if bytes_per_record <= 1000:  # full row reads ~hundreds of bytes; footer reads <100
+        return None
+    # Tier by absolute read amplification cost. The bug is the same at every
+    # scale, but the operational urgency tracks the bytes wasted.
+    if ctx.input_bytes >= 1024 ** 3:           # >= 1 GB
+        severity = "high"
+    elif ctx.input_bytes >= 10 * 1024 * 1024:  # 10 MB - 1 GB
+        severity = "medium"
+    else:                                       # 1 - 10 MB
+        severity = "low"
+    return Finding(
+        rule_id="count_star_full_scan",
+        severity=severity,
+        stage_id=ctx.stage_id,
+        evidence={
+            "input_bytes": ctx.input_bytes,
+            "shuffle_read_records": records,
+            "bytes_per_record": int(bytes_per_record),
+            "note": "count(*) aggregation node observed in SQL plan",
+        },
+        linked_issue="hudi-18769-count-star",
+        recommendation=(
+            "Watch apache/hudi#18770 for merge. Workaround: query raw "
+            "parquet directly if this is performance-critical."
+        ),
+    )
 
 
 def rule_mdt_over_parallelization(ctx: StageContext) -> Optional[Finding]:
@@ -70,27 +79,36 @@ def rule_mdt_over_parallelization(ctx: StageContext) -> Optional[Finding]:
     if ctx.num_tasks < 50:
         return None
     avg_per_task = ctx.avg_input_per_task_bytes
-    if avg_per_task < 100 * 1024:  # < 100 KB per task = over-parallel
-        return Finding(
-            rule_id="mdt_over_parallelization",
-            severity="medium",
-            stage_id=ctx.stage_id,
-            evidence={
-                "hudi_phase": ctx.hudi_phase,
-                "num_tasks": ctx.num_tasks,
-                "input_bytes": ctx.input_bytes,
-                "shuffle_read_bytes": ctx.shuffle_read_bytes,
-                "avg_per_task_bytes": int(avg_per_task),
-                "note": "MDT shuffle parallelism much larger than data warrants",
-            },
-            linked_issue="mdt-over-parallelization",
-            recommendation=(
-                "Lower hoodie.metadata.*.parallelism for this MDT partition. "
-                "Target ~5000-50000 records per task. Rule of thumb: "
-                "raise per-task data to at least 1MB."
-            ),
-        )
-    return None
+    if avg_per_task >= 100 * 1024:  # > 100 KB per task = healthy
+        return None
+    # Tier by combined signal: severe over-parallelism is num_tasks AND
+    # very-low per-task input. Modest cases get low severity so they don't
+    # drown the high-impact ones.
+    if ctx.num_tasks >= 1000 and avg_per_task < 10 * 1024:
+        severity = "high"
+    elif ctx.num_tasks >= 200 and avg_per_task < 50 * 1024:
+        severity = "medium"
+    else:
+        severity = "low"
+    return Finding(
+        rule_id="mdt_over_parallelization",
+        severity=severity,
+        stage_id=ctx.stage_id,
+        evidence={
+            "hudi_phase": ctx.hudi_phase,
+            "num_tasks": ctx.num_tasks,
+            "input_bytes": ctx.input_bytes,
+            "shuffle_read_bytes": ctx.shuffle_read_bytes,
+            "avg_per_task_bytes": int(avg_per_task),
+            "note": "MDT shuffle parallelism much larger than data warrants",
+        },
+        linked_issue="mdt-over-parallelization",
+        recommendation=(
+            "Lower hoodie.metadata.*.parallelism for this MDT partition. "
+            "Target ~5000-50000 records per task. Rule of thumb: "
+            "raise per-task data to at least 1MB."
+        ),
+    )
 
 
 def rule_mor_count_skipping_footer_fast_path(ctx: StageContext) -> Optional[Finding]:
@@ -131,49 +149,62 @@ def rule_global_index_full_shuffle(ctx: StageContext) -> Optional[Finding]:
     if ctx.shuffle_write_bytes < 100 * 1024 * 1024:
         # only flag at meaningful scale
         return None
-    if ctx.shuffle_amplification > 10:
-        return Finding(
-            rule_id="global_index_full_shuffle",
-            severity="high",
-            stage_id=ctx.stage_id,
-            evidence={
-                "shuffle_write_bytes": ctx.shuffle_write_bytes,
-                "input_bytes": ctx.input_bytes,
-                "shuffle_amplification": round(ctx.shuffle_amplification, 1),
-            },
-            linked_issue="global-simple-index-small-upsert",
-            recommendation=(
-                "GLOBAL_SIMPLE / GLOBAL_BLOOM index moves the entire target side. "
-                "If your upsert respects partition boundaries, switch to SIMPLE "
-                "or BLOOM (local). For true global lookup, use RECORD_INDEX."
-            ),
-        )
-    return None
+    if ctx.shuffle_amplification <= 10:
+        return None
+    # Tier by absolute shuffle volume. A 200 MB amplified shuffle is the
+    # same pattern as a 50 GB one but has very different operational urgency.
+    if ctx.shuffle_write_bytes >= 10 * 1024 ** 3:        # >= 10 GB
+        severity = "high"
+    elif ctx.shuffle_write_bytes >= 1024 ** 3:           # 1 GB - 10 GB
+        severity = "medium"
+    else:                                                 # 100 MB - 1 GB
+        severity = "low"
+    return Finding(
+        rule_id="global_index_full_shuffle",
+        severity=severity,
+        stage_id=ctx.stage_id,
+        evidence={
+            "shuffle_write_bytes": ctx.shuffle_write_bytes,
+            "input_bytes": ctx.input_bytes,
+            "shuffle_amplification": round(ctx.shuffle_amplification, 1),
+        },
+        linked_issue="global-simple-index-small-upsert",
+        recommendation=(
+            "GLOBAL_SIMPLE / GLOBAL_BLOOM index moves the entire target side. "
+            "If your upsert respects partition boundaries, switch to SIMPLE "
+            "or BLOOM (local). For true global lookup, use RECORD_INDEX."
+        ),
+    )
 
 
 def rule_marker_handler_dominates(ctx: StageContext) -> Optional[Finding]:
     """Stages spent in marker management indicate W-6 territory."""
     if ctx.hudi_phase != "markerHandling":
         return None
-    # If a marker stage is on the critical path and > 1s, flag it
-    if ctx.duration_ms > 1000:
-        return Finding(
-            rule_id="marker_handler_dominates",
-            severity="medium",
-            stage_id=ctx.stage_id,
-            evidence={
-                "duration_ms": ctx.duration_ms,
-                "stage_name": ctx.name,
-            },
-            linked_issue="w6-marker-batch-interval",
-            recommendation=(
-                "Marker batch interval defaults to 50ms and is paid serially "
-                "per file. Lower hoodie.markerBatchIntervalMs to 10ms, OR set "
-                "hoodie.write.markers.type=DIRECT (use the latter for "
-                "object-store backends; the former for local FS / HDFS)."
-            ),
-        )
-    return None
+    # Require a material duration before flagging: 1s of marker work on a
+    # multi-minute commit isn't worth a finding. Tier by absolute time.
+    if ctx.duration_ms < 5 * 1000:
+        return None
+    if ctx.duration_ms >= 30 * 1000:       # >= 30 s
+        severity = "high"
+    else:                                   # 5 - 30 s
+        severity = "medium"
+    return Finding(
+        rule_id="marker_handler_dominates",
+        severity=severity,
+        stage_id=ctx.stage_id,
+        evidence={
+            "duration_ms": ctx.duration_ms,
+            "stage_name": ctx.name,
+        },
+        linked_issue="w6-marker-batch-interval",
+        recommendation=(
+            "Marker batch interval defaults to 50ms and is paid serially "
+            "per file. Lower hoodie.markerBatchIntervalMs to 10ms, OR set "
+            "hoodie.write.markers.type=DIRECT (use the latter for "
+            "object-store backends; the former for local FS / HDFS)."
+        ),
+    )
 
 
 def rule_shuffle_spill(ctx: StageContext) -> Optional[Finding]:
@@ -222,19 +253,35 @@ def rule_shuffle_spill(ctx: StageContext) -> Optional[Finding]:
 
 
 def rule_skew(ctx: StageContext) -> Optional[Finding]:
-    """Long-tail task distribution within a stage."""
+    """Long-tail task distribution within a stage.
+
+    Requires both relative skew (p99/median ratio) AND absolute duration
+    above floor thresholds, to avoid firing on JIT-warmup artifacts at
+    small scale (the canonical false positive: p99=300ms vs median=20ms
+    is a 15x ratio but the absolute work is sub-second).
+    """
     if ctx.num_tasks < 10:
         return None
     if ctx.skew_ratio < 5:
         return None
+    p99 = ctx.task_duration_p99_ms
+    med = ctx.task_duration_median_ms
+    # Absolute-duration gate: only flag when the long tail is actually painful
+    if p99 < 2_000 and med < 200:
+        return None
+    # Tier severity by the absolute long-tail cost
+    if p99 >= 30_000:
+        severity = "high"
+    else:
+        severity = "medium"
     return Finding(
         rule_id="task_skew",
-        severity="medium",
+        severity=severity,
         stage_id=ctx.stage_id,
         evidence={
             "num_tasks": ctx.num_tasks,
-            "task_duration_p99_ms": ctx.task_duration_p99_ms,
-            "task_duration_median_ms": ctx.task_duration_median_ms,
+            "task_duration_p99_ms": p99,
+            "task_duration_median_ms": med,
             "skew_ratio": round(ctx.skew_ratio, 1),
             "hudi_phase": ctx.hudi_phase,
         },
@@ -248,14 +295,27 @@ def rule_skew(ctx: StageContext) -> Optional[Finding]:
 
 
 def rule_fetch_wait_dominates(ctx: StageContext) -> Optional[Finding]:
-    """Stage is fetch-bound rather than compute-bound."""
+    """Stage is fetch-bound rather than compute-bound.
+
+    Requires both a meaningful absolute wait time AND the wait fraction to
+    avoid firing on tiny stages where a 100ms fetch wait happens to be 30%
+    of a 300ms stage — technically matches the ratio but is operationally
+    irrelevant.
+    """
     if ctx.shuffle_read_bytes < 10 * 1024 * 1024:
         return None
     if ctx.fetch_wait_fraction < 0.3:
         return None
+    if ctx.fetch_wait_time_ms < 5_000:
+        return None
+    # Tier by absolute fetch-wait time
+    if ctx.fetch_wait_time_ms >= 30_000:
+        severity = "high"
+    else:                                # 5-30 s
+        severity = "medium"
     return Finding(
         rule_id="fetch_wait_dominates",
-        severity="medium",
+        severity=severity,
         stage_id=ctx.stage_id,
         evidence={
             "shuffle_read_bytes": ctx.shuffle_read_bytes,
