@@ -28,6 +28,7 @@ from rules import (  # noqa: E402
     rule_skew,
     rule_fetch_wait_dominates,
     rule_table_service_plan_per_partition_metadata_fetch,
+    rule_metadata_bound_stage,
 )
 
 
@@ -417,6 +418,85 @@ class TestTableServicePlanPerPartitionMetadataFetch(unittest.TestCase):
             self, rule_table_service_plan_per_partition_metadata_fetch, ctx,
             "hudi_phase is not compactionPlan / clusteringPlan"
         )
+
+
+class TestMetadataBoundStageGeneric(unittest.TestCase):
+    """The generic 'wait but not I/O' detector — should catch any future
+    variant of the compaction-plan-style pattern without requiring a
+    dedicated rule."""
+
+    UNKNOWN_PATTERN_DETAILS = (
+        "org.apache.spark.api.java.AbstractJavaRDDLike.collect(JavaRDDLike.scala:45)\n"
+        "org.apache.hudi.client.common.HoodieSparkEngineContext.flatMap(...)\n"
+        "org.apache.hudi.somethingFutureNotYetClassified(...)\n"
+    )
+
+    def test_fires_on_uncovered_wait_but_not_io_signature(self):
+        # Pattern: many parallel tasks, tiny CPU, zero Spark I/O, but
+        # not (yet) classified into a known phase
+        ctx = make_ctx(
+            details=self.UNKNOWN_PATTERN_DETAILS,
+            num_tasks=500,
+            executor_run_time_ms=60_000,
+            executor_cpu_time_ns=500_000_000,  # 0.5s CPU on 60s wall = 0.8% efficiency
+        )
+        assert_fires(self, rule_metadata_bound_stage, ctx, "low")
+
+    def test_does_not_double_fire_on_compaction_plan(self):
+        # When a more-specific rule covers the case, this generic rule should
+        # silently defer to avoid duplicate findings on the same stage.
+        compaction_details = (
+            "org.apache.hudi.client.common.HoodieSparkEngineContext.flatMap(...)\n"
+            "org.apache.hudi.table.action.compact.plan.generators."
+            "BaseHoodieCompactionPlanGenerator.generateCompactionPlan(...)\n"
+        )
+        ctx = make_ctx(
+            details=compaction_details,
+            num_tasks=2070,
+            executor_run_time_ms=263_500,
+            executor_cpu_time_ns=1_100_000_000,
+        )
+        assert_filtered(
+            self, rule_metadata_bound_stage, ctx,
+            "covered by rule_table_service_plan_per_partition_metadata_fetch"
+        )
+
+    def test_filter_below_task_floor(self):
+        ctx = make_ctx(
+            details=self.UNKNOWN_PATTERN_DETAILS,
+            num_tasks=10, executor_run_time_ms=60_000,
+            executor_cpu_time_ns=500_000_000,
+        )
+        assert_filtered(self, rule_metadata_bound_stage, ctx, "num_tasks < 50")
+
+    def test_filter_below_wall_floor(self):
+        ctx = make_ctx(
+            details=self.UNKNOWN_PATTERN_DETAILS,
+            num_tasks=500, executor_run_time_ms=500,
+            executor_cpu_time_ns=1_000_000,
+        )
+        assert_filtered(self, rule_metadata_bound_stage, ctx, "duration < 2s")
+
+    def test_filter_when_cpu_efficiency_high(self):
+        # CPU work IS happening — this is a real compute stage, not metadata-bound
+        ctx = make_ctx(
+            details=self.UNKNOWN_PATTERN_DETAILS,
+            num_tasks=500,
+            executor_run_time_ms=60_000,
+            executor_cpu_time_ns=50_000_000_000,  # 50s CPU on 60s wall = 83% efficiency
+        )
+        assert_filtered(self, rule_metadata_bound_stage, ctx, "cpu_efficiency >= 10%")
+
+    def test_filter_when_stage_has_io_bytes(self):
+        # Even a single byte of Spark-tracked I/O disqualifies — this is data work
+        ctx = make_ctx(
+            details=self.UNKNOWN_PATTERN_DETAILS,
+            num_tasks=500,
+            executor_run_time_ms=60_000,
+            executor_cpu_time_ns=500_000_000,
+            input_bytes=1,  # has Spark-tracked I/O
+        )
+        assert_filtered(self, rule_metadata_bound_stage, ctx, "has Spark-tracked I/O")
 
 
 if __name__ == "__main__":

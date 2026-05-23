@@ -398,6 +398,73 @@ def rule_table_service_plan_per_partition_metadata_fetch(ctx: StageContext) -> O
     )
 
 
+# Stage phases that already have a specific, more-actionable rule. Skip them
+# from the generic detector to avoid duplicate findings on the same stage.
+_SPECIFIC_PHASES_HANDLED_ELSEWHERE = ("compactionPlan", "clusteringPlan")
+
+
+def rule_metadata_bound_stage(ctx: StageContext) -> Optional[Finding]:
+    """Generic detector for "wait but not I/O" stages — a stage with many
+    parallel tasks doing almost no CPU work and producing no Spark-tracked
+    I/O bytes is almost certainly waiting on RPC / metadata-store / S3-LIST
+    calls outside Spark's I/O accounting.
+
+    This rule is the **methodology lesson** from the compaction-plan
+    investigation distilled into code: that finding hinged on three signals
+    co-occurring (high numTasks × low cpu_efficiency × zero Spark I/O bytes).
+    Future variants of the same class of issue — workload-profile collects,
+    archive scans, MDT bootstrap, glue-sync, etc. — share the signature.
+
+    Severity is `low` by design: the rule is a candidate-for-investigation
+    flag, not a confirmed issue. Specific rules (e.g.
+    rule_table_service_plan_per_partition_metadata_fetch) catch known
+    variants with `high` severity; this rule catches the next one before
+    anyone has written a specific rule for it.
+
+    Skips stages already covered by a more-specific rule (matched by
+    hudi_phase) so the same stage doesn't produce duplicate findings.
+    """
+    # Skip phases that have their own dedicated rule
+    if ctx.hudi_phase in _SPECIFIC_PHASES_HANDLED_ELSEWHERE:
+        return None
+    # Need genuine fan-out — single-task stages aren't the pattern
+    if ctx.num_tasks < 50:
+        return None
+    # Don't fire on trivially-short stages
+    if ctx.duration_ms < 2_000:
+        return None
+    # Stage must be CPU-starved (waiting on something external)
+    if ctx.cpu_efficiency >= 0.10:
+        return None
+    # And must have NO Spark-tracked I/O (else it's data work, not metadata work)
+    if ctx.has_any_io_bytes:
+        return None
+    return Finding(
+        rule_id="metadata_bound_stage",
+        severity="low",
+        stage_id=ctx.stage_id,
+        evidence={
+            "num_tasks": ctx.num_tasks,
+            "executor_run_time_ms": ctx.duration_ms,
+            "executor_cpu_time_ms": ctx.executor_cpu_time_ns // 1_000_000,
+            "cpu_efficiency": round(ctx.cpu_efficiency, 4),
+            "hudi_phase": ctx.hudi_phase,
+            "stage_name": ctx.name,
+        },
+        linked_issue="metadata-bound-stage-generic",
+        recommendation=(
+            "This stage spent ~all of its time waiting on RPC / metadata-store / "
+            "S3-LIST calls (very low CPU, zero Spark-tracked I/O). Examine the "
+            "stage's `details` call stack to identify the Hudi (or other) class "
+            "responsible and check whether a batched alternative API exists. "
+            "Common culprits: per-partition file listing, per-file MDT lookups, "
+            "per-table catalog sync, archive scans. If you identify a specific "
+            "code path that should batch its calls, file a follow-up and add a "
+            "dedicated detection rule to rules.py."
+        ),
+    )
+
+
 # ──────────────────────── Job-level rules (cross-stage) ───────────────────
 
 
@@ -538,6 +605,7 @@ STAGE_RULES: List[Callable[[StageContext], Optional[Finding]]] = [
     rule_skew,
     rule_fetch_wait_dominates,
     rule_table_service_plan_per_partition_metadata_fetch,
+    rule_metadata_bound_stage,
 ]
 
 JOB_RULES: List[Callable] = [

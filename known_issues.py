@@ -343,6 +343,54 @@ KNOWN_ISSUES = {
         ),
     },
 
+    "metadata-bound-stage-generic": {
+        "title": (
+            "Generic 'wait but not I/O' stage signature — many parallel tasks "
+            "doing near-zero CPU work with no Spark-tracked I/O bytes"
+        ),
+        "upstream": "internal (methodology / catch-all for un-classified patterns)",
+        "affected_versions": "any",
+        "severity": "low",
+        "description": (
+            "A stage with high numTasks, very low cpu_efficiency, and zero\n"
+            "Spark-tracked I/O bytes is almost always waiting on external\n"
+            "RPC / metadata-store / S3-LIST calls. Spark accounts for input,\n"
+            "output, and shuffle bytes — but not for arbitrary network calls\n"
+            "made from a user lambda — so workloads that fan out RPC work to\n"
+            "executors look idle to Spark's accounting yet stall on per-task\n"
+            "latency.\n"
+            "\n"
+            "This entry is the CATCH-ALL for the pattern. Known instances:\n"
+            "  - table-service-plan-per-partition-metadata-fetch  (the\n"
+            "    documented and fixable case — see that entry for details)\n"
+            "\n"
+            "Likely future instances when this rule fires:\n"
+            "  - per-partition file listing in archive scans\n"
+            "  - per-file MDT lookups during MDT bootstrap\n"
+            "  - per-table catalog sync (Glue, Hive)\n"
+            "  - workload-profile collection on writes with many partitions\n"
+            "  - per-file timeline-archiver verifications\n"
+            "\n"
+            "Signature in Spark UI:\n"
+            "  - numTasks >= 50\n"
+            "  - executor_run_time sum >= 2s (not a trivial stage)\n"
+            "  - cpu_efficiency (executorCpuTime / executorRunTime) < 10%\n"
+            "  - inputBytes + outputBytes + shuffleReadBytes + shuffleWriteBytes == 0\n"
+            "  - hudi_phase NOT one already covered by a more-specific rule\n"
+        ),
+        "recommendation": (
+            "Investigate the call stack (stage.details) to identify the code\n"
+            "path. Specifically look for `engineContext.flatMap` /\n"
+            "`parallelize(partitionPaths, ...)` patterns where each task does\n"
+            "an independent metadata call — these are the canonical shape.\n"
+            "Check whether a batched alternative API exists at the same\n"
+            "metadata layer (e.g. `getAllFilesInPartitions(Collection)` vs\n"
+            "`getAllFilesInPartition(path)`). If a fix shape emerges, file\n"
+            "the specific known-issue entry and add a dedicated rule in\n"
+            "rules.py with a higher severity than this catch-all."
+        ),
+    },
+
     "r2-file-size-bloat": {
         "title": "Per-file metadata bloat — Hudi files carry ~440 KB extra per file",
         "upstream": "W-r2-#3 (no upstream filing; structural)",
