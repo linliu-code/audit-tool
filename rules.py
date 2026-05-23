@@ -480,6 +480,13 @@ def rule_delete_should_be_drop_partition(
 
     Without parsing the SQL we can only flag the first two; for v1 we use the
     presence of tagLocation as a proxy for "per-row delete path active".
+
+    Severity tiers by cumulative tagLocation shuffle_write_bytes (a proxy
+    for the size of the delete, and therefore the magnitude of the wasted
+    work the per-row path is doing):
+      - >= 1 GB    -> high   (big delete; 100x speedup is operationally real)
+      - 100MB-1GB  -> medium
+      - < 100 MB   -> filter (the 100x speedup is sub-second; not actionable)
     """
     if not hudi_commit:
         return []
@@ -487,17 +494,28 @@ def rule_delete_should_be_drop_partition(
     if op_type != "delete":
         return []
     # Look for tagLocation + write stages (per-row delete path)
-    has_taglocation = any(s.hudi_phase == "tagLocation" for s in job_stages)
-    if not has_taglocation:
+    tag_stages = [s for s in job_stages if s.hudi_phase == "tagLocation"]
+    if not tag_stages:
         return []
+    total_tag_shuffle = sum(s.shuffle_write_bytes for s in tag_stages)
+    # Floor: tiny deletes aren't worth flagging
+    if total_tag_shuffle < 100 * 1024 * 1024:
+        return []
+    # Tier by absolute size of the per-row path's work
+    if total_tag_shuffle >= 1024 ** 3:  # >= 1 GB
+        severity = "high"
+    else:                                # 100 MB - 1 GB
+        severity = "medium"
     return [Finding(
         rule_id="delete_should_be_drop_partition",
-        severity="high",
+        severity=severity,
         stage_id=None,
         rule_kind="job",
         evidence={
             "hudi_operation": op_type,
             "has_taglocation_stage": True,
+            "tag_shuffle_write_bytes_total": total_tag_shuffle,
+            "tag_stage_count": len(tag_stages),
             "note": (
                 "DELETE operation with per-row tagging. If the WHERE predicate "
                 "references only partition columns, this could have been "
@@ -522,9 +540,17 @@ def rule_merge_into_smj_with_small_source(
     """MERGE INTO using SortMergeJoin when source side is small enough for BHJ.
 
     Detection: a stage whose hudi_phase is mergeSourceJoin with shuffle_write
-    bytes below ~50MB suggests source could have been broadcast but wasn't.
+    bytes below ~100 MB suggests source could have been broadcast but wasn't.
+
+    Severity tiers (smaller source = stronger BHJ candidate = higher urgency):
+      - < 10 MB    -> high   (well under AQE's default broadcast threshold)
+      - 10 - 50 MB -> medium (likely BHJ-eligible with raised threshold)
+      - 50 - 100MB -> low    (borderline; raising threshold may help)
+    Floor: shuffle_write < 1 MB filtered out (empty-source SMJ is a degenerate
+    case, not a useful finding).
     """
     findings = []
+    MIN_SHUFFLE = 1 * 1024 * 1024
     for s in job_stages:
         if s.hudi_phase != "mergeSourceJoin":
             continue
@@ -532,9 +558,17 @@ def rule_merge_into_smj_with_small_source(
             continue
         if s.shuffle_write_bytes > 100 * 1024 * 1024:
             continue  # source side genuinely large, SMJ is correct
+        if s.shuffle_write_bytes < MIN_SHUFFLE:
+            continue  # degenerate: source effectively empty
+        if s.shuffle_write_bytes < 10 * 1024 * 1024:
+            severity = "high"
+        elif s.shuffle_write_bytes < 50 * 1024 * 1024:
+            severity = "medium"
+        else:                                  # 50 - 100 MB
+            severity = "low"
         findings.append(Finding(
             rule_id="merge_into_smj_small_source",
-            severity="medium",
+            severity=severity,
             stage_id=s.stage_id,
             evidence={
                 "stage_name": s.name,
@@ -555,7 +589,16 @@ def rule_bulkinsert_sort_none_many_partitions(
     job_stages: List[StageContext],
     hudi_table_config: Optional[Dict] = None,
 ) -> List[Finding]:
-    """bulkinsert.sort.mode=NONE with many partitions risks W-6 OOM."""
+    """bulkinsert.sort.mode=NONE with many partitions risks W-6 OOM.
+
+    Severity tiers by num_tasks (partition-count proxy). OOM risk scales
+    with the number of distinct partition paths a single task may see
+    open writers for at once:
+      - > 500 tasks  -> high   (definite OOM territory; matches the
+                                empirically-known p=200+ regime)
+      - 100 - 500    -> medium (still risky)
+      - 50 - 100     -> low    (bug exists; small datasets tend not to OOM)
+    """
     if hudi_table_config is None:
         return []
     sort_mode = hudi_table_config.get("hoodie.bulkinsert.sort.mode", "NONE").upper()
@@ -567,28 +610,35 @@ def rule_bulkinsert_sort_none_many_partitions(
             continue
         # Approximate "many partitions" by output records / num_tasks heuristic
         # Better: read commit metadata. v1 uses a simple proxy.
-        if s.num_tasks > 50:
-            return [Finding(
-                rule_id="bulkinsert_sort_none_many_partitions",
-                severity="high",
-                stage_id=s.stage_id,
-                evidence={
-                    "stage_name": s.name,
-                    "num_tasks": s.num_tasks,
-                    "current_sort_mode": "NONE",
-                    "note": (
-                        "bulkinsert.sort.mode=NONE keeps one parquet writer "
-                        "open per partition path seen, leading to heap pressure "
-                        "and OOM at high partition counts."
-                    ),
-                },
-                linked_issue="w6-bulkinsert-sort-none",
-                recommendation=(
-                    "Set hoodie.bulkinsert.sort.mode=PARTITION_SORT. Closes "
-                    "prior writer on partition transition. Empirically: 261s → 18s "
-                    "at p=200, eliminates OOM regime."
+        if s.num_tasks <= 50:
+            continue
+        if s.num_tasks > 500:
+            severity = "high"
+        elif s.num_tasks > 100:
+            severity = "medium"
+        else:                              # 51 - 100
+            severity = "low"
+        return [Finding(
+            rule_id="bulkinsert_sort_none_many_partitions",
+            severity=severity,
+            stage_id=s.stage_id,
+            evidence={
+                "stage_name": s.name,
+                "num_tasks": s.num_tasks,
+                "current_sort_mode": "NONE",
+                "note": (
+                    "bulkinsert.sort.mode=NONE keeps one parquet writer "
+                    "open per partition path seen, leading to heap pressure "
+                    "and OOM at high partition counts."
                 ),
-            )]
+            },
+            linked_issue="w6-bulkinsert-sort-none",
+            recommendation=(
+                "Set hoodie.bulkinsert.sort.mode=PARTITION_SORT. Closes "
+                "prior writer on partition transition. Empirically: 261s → 18s "
+                "at p=200, eliminates OOM regime."
+            ),
+        )]
     return []
 
 
