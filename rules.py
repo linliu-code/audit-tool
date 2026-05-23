@@ -177,23 +177,46 @@ def rule_marker_handler_dominates(ctx: StageContext) -> Optional[Finding]:
 
 
 def rule_shuffle_spill(ctx: StageContext) -> Optional[Finding]:
-    """Any shuffle stage with disk spill is operating under memory pressure."""
-    if ctx.disk_spill_bytes <= 0:
+    """Shuffle stage with material disk spill, indicating reduce-side memory pressure.
+
+    Reports only material spills — Spark spills tiny amounts routinely during
+    normal hash-aggregation flushes (a few KB), which is not a problem and
+    fires false-positive findings without a minimum threshold.
+
+    Tiers:
+      - >= 5 GB memory_spill  → severity high (OOM-territory, urgent)
+      - 100 MB < x < 5 GB     → severity medium (real pressure)
+      - <  100 MB             → don't fire (normal flush behavior)
+    """
+    MIN_DISK_SPILL = 1 * 1024 * 1024     # 1 MB — must have actually paged to disk
+    MIN_MEMORY_SPILL = 100 * 1024 * 1024  # 100 MB — must be a material amount
+    HIGH_MEMORY_SPILL = 5 * 1024 * 1024 * 1024  # 5 GB → high severity
+
+    if ctx.disk_spill_bytes < MIN_DISK_SPILL:
         return None
+    if ctx.memory_spill_bytes < MIN_MEMORY_SPILL:
+        return None
+
+    severity = "high" if ctx.memory_spill_bytes >= HIGH_MEMORY_SPILL else "medium"
     return Finding(
         rule_id="shuffle_spill",
-        severity="medium",
+        severity=severity,
         stage_id=ctx.stage_id,
         evidence={
             "memory_spill_bytes": ctx.memory_spill_bytes,
             "disk_spill_bytes": ctx.disk_spill_bytes,
             "hudi_phase": ctx.hudi_phase,
+            "stage_name": ctx.name,
         },
         linked_issue=None,
         recommendation=(
-            "Reduce-side memory pressure. Options: raise spark.executor.memory, "
-            "raise spark.memory.fraction, lower spark.reducer.maxSizeInFlight, "
-            "or raise shuffle.partitions (smaller per-task data)."
+            "Reduce-side memory pressure. The shuffle's per-task working set "
+            "exceeded the spill threshold and paged to disk. Options: raise "
+            "spark.executor.memory; raise spark.memory.fraction; lower "
+            "spark.reducer.maxSizeInFlight; raise shuffle.partitions to make "
+            "per-task data smaller. For multi-GB spills, the root cause is "
+            "often skewed shuffle keys or a wrong-scale aggregation (e.g. "
+            "global index countByKey on a large dataset for a small upsert)."
         ),
     )
 
