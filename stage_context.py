@@ -13,6 +13,147 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
+# ──────────────────────── Hudi phase classification ──────────────────────
+#
+# Hudi stages can be identified by either:
+#   - the descriptive stage `name` set by Hudi (e.g. "tagLocation")
+#   - the call-stack `details` carrying a Hudi class name when the stage
+#     name is generic (e.g. "collect at HoodieSparkEngineContext.java:160")
+#
+# Many Hudi action-executor stages fall into the second bucket — they all
+# look identical by `name` but the call-stack discriminates which action
+# they're executing.
+
+# Phase labels emitted by hudi_phase. Listed here for documentation /
+# discoverability; nothing in the runtime path consults this set.
+_PHASE_LABELS = {
+    "tagLocation",            # write-path index lookup
+    "fileGroupShuffle",       # file-group repartition
+    "baseFileWrite",          # bulk_insert / upsert / insert writing parquet
+    "workloadProfile",        # WorkloadProfile collection on the driver
+    "markerHandling",         # marker creation / list
+    "mergeSourceJoin",        # MERGE INTO's source-side join (user query)
+    "commit",                 # commit finalization
+    # MDT (Metadata Table) writes
+    "mdtWrite",
+    "mdtRliWrite",
+    "mdtColStatsWrite",
+    "mdtBloomWrite",
+    "mdtPartitionStatsWrite",
+    # Table-service planning + execution
+    "compactionPlan",
+    "compactionExecute",
+    "clusteringPlan",
+    "clusteringExecute",
+    "cleanPlan",
+    "cleanExecute",
+    "rollback",
+    "archive",
+    # Bootstrap / catalog-sync paths
+    "bootstrap",              # Hudi's own initial-load bootstrap
+    "hiveSync",               # Hive metastore sync
+    "glueSync",               # AWS Glue catalog sync
+    # DS source reads (data flowing IN, not Hudi-internal work)
+    "kafkaSourceFetch",
+    "jdbcSourceFetch",
+    "incrementalSourceFetch",
+    "unknown",
+}
+
+
+def _phase_from_name(name: str) -> Optional[str]:
+    """Match phase from the descriptive stage name. Returns None when the
+    name doesn't carry a recognizable phase signal."""
+    n = (name or "").lower()
+    if not n:
+        return None
+    # tagLocation / index lookups on the write path
+    if "taglocation" in n or "bloomindex" in n or "simpleindex" in n:
+        return "tagLocation"
+    # MDT writes — order matters; specific labels first, then generic mdt
+    if "metadatapartitionstats" in n or "partition_stats" in n:
+        return "mdtPartitionStatsWrite"
+    if "metadatarecordindex" in n or "record_index" in n or "rli" in n:
+        return "mdtRliWrite"
+    if "metadatacolumnstats" in n or "column_stats" in n or "col_stats" in n:
+        return "mdtColStatsWrite"
+    if "metadatabloomfilter" in n or "bloom_filter" in n:
+        return "mdtBloomWrite"
+    if "metadatatable" in n or "metadatawriter" in n:
+        return "mdtWrite"
+    if "workloadprofile" in n:
+        return "workloadProfile"
+    if "dobulkinsert" in n or "bulkinsert" in n:
+        return "baseFileWrite"
+    if "doupsert" in n or "doinsert" in n:
+        return "baseFileWrite"
+    if "repartition" in n and "filegroup" in n.replace("_", ""):
+        return "fileGroupShuffle"
+    if "markerhandler" in n or "createmarker" in n:
+        return "markerHandling"
+    if "sortmergejoin" in n or "broadcasthashjoin" in n or "shuffledhashjoin" in n:
+        return "mergeSourceJoin"
+    return None
+
+
+# Call-stack class-name patterns. Match the FIRST entry that has its class
+# substring present in `details`. Ordered so that more-specific patterns
+# precede more-general ones (e.g. PartitionAware before generic Compaction).
+_DETAILS_CLASS_PATTERNS = [
+    # ── Compaction ──────────────────────────────────────────────────────
+    ("CompactionPlanGenerator", "compactionPlan"),
+    ("ScheduleCompactionActionExecutor", "compactionPlan"),
+    ("RunCompactionActionExecutor", "compactionExecute"),
+    ("HoodieSparkMergeOnReadTableCompactor", "compactionExecute"),
+    # ── Clustering ──────────────────────────────────────────────────────
+    ("ClusteringPlanStrategy", "clusteringPlan"),
+    ("ClusteringPlanActionExecutor", "clusteringPlan"),
+    ("ScheduleClusteringActionExecutor", "clusteringPlan"),
+    ("RunClusteringActionExecutor", "clusteringExecute"),
+    ("SparkExecuteClusteringCommitActionExecutor", "clusteringExecute"),
+    # ── Clean ───────────────────────────────────────────────────────────
+    ("CleanPlanActionExecutor", "cleanPlan"),
+    ("CleanPlanner", "cleanPlan"),
+    ("HoodieCleanActionExecutor", "cleanExecute"),
+    # ── Rollback ────────────────────────────────────────────────────────
+    ("BaseRollbackActionExecutor", "rollback"),
+    ("BaseRollbackHelper", "rollback"),
+    ("RollbackActionExecutor", "rollback"),
+    # ── Archive ─────────────────────────────────────────────────────────
+    ("HoodieTimelineArchiver", "archive"),
+    # ── Bootstrap ───────────────────────────────────────────────────────
+    ("HoodieBootstrapJobOperator", "bootstrap"),
+    ("BootstrapActionExecutor", "bootstrap"),
+    # ── Catalog sync ────────────────────────────────────────────────────
+    # Glue-specific FIRST (it would also match HiveSync* generically)
+    ("AWSGlueCatalogSyncClient", "glueSync"),
+    ("GlueSyncTool", "glueSync"),
+    ("HiveSyncTool", "hiveSync"),
+    ("HMSDDLExecutor", "hiveSync"),
+    ("HiveQueryDDLExecutor", "hiveSync"),
+    # ── DS source fetches ───────────────────────────────────────────────
+    # These represent user-data flowing IN, not Hudi-internal work.
+    ("S3EventsHoodieIncrSource", "incrementalSourceFetch"),
+    ("HoodieIncrSource", "incrementalSourceFetch"),
+    ("KafkaSource", "kafkaSourceFetch"),
+    ("JdbcSource", "jdbcSourceFetch"),
+    # ── MDT writes (call-stack form) ────────────────────────────────────
+    # When MDT writes use a generic stage name, the writer class names them.
+    ("HoodieBackedTableMetadataWriter", "mdtWrite"),
+]
+
+
+def _phase_from_details(details: str) -> Optional[str]:
+    """Match phase from the stage call-stack `details`. Returns None when
+    no recognizable class appears. Earlier patterns take priority."""
+    if not details:
+        return None
+    for class_substring, label in _DETAILS_CLASS_PATTERNS:
+        if class_substring in details:
+            return label
+    return None
+
+
 @dataclass
 class StageContext:
     # raw inputs
@@ -164,45 +305,24 @@ class StageContext:
     @property
     def hudi_phase(self) -> str:
         """Heuristic classification of this stage's Hudi-attributable phase.
-        Returns one of: 'tagLocation', 'fileGroupShuffle', 'baseFileWrite',
-        'mdtWrite', 'mdtRliWrite', 'mdtColStatsWrite', 'mdtBloomWrite',
-        'workloadProfile', 'commit', 'mergeSourceJoin',
-        'compactionPlan', 'clusteringPlan', 'unknown'."""
-        n = self.name.lower()
-        if "taglocation" in n or "bloomindex" in n or "simpleindex" in n:
-            return "tagLocation"
-        if "metadatapartitionstats" in n or "partition_stats" in n:
-            return "mdtPartitionStatsWrite"
-        if "metadatarecordindex" in n or "record_index" in n or "rli" in n:
-            return "mdtRliWrite"
-        if "metadatacolumnstats" in n or "column_stats" in n or "col_stats" in n:
-            return "mdtColStatsWrite"
-        if "metadatabloomfilter" in n or "bloom_filter" in n:
-            return "mdtBloomWrite"
-        if "metadatatable" in n or "metadatawriter" in n:
-            return "mdtWrite"
-        if "workloadprofile" in n:
-            return "workloadProfile"
-        if "dobulkinsert" in n or "bulkinsert" in n:
-            return "baseFileWrite"
-        if "doupsert" in n:
-            return "baseFileWrite"
-        if "doinsert" in n:
-            return "baseFileWrite"
-        if "repartition" in n and "filegroup" in n.replace("_", ""):
-            return "fileGroupShuffle"
-        if "markerhandler" in n or "createmarker" in n:
-            return "markerHandling"
-        if "sortmergejoin" in n or "broadcasthashjoin" in n or "shuffledhashjoin" in n:
-            return "mergeSourceJoin"
-        # The stage name for table-service-plan stages is generic
-        # ("collect at HoodieSparkEngineContext.java:..."); fall back to the
-        # stack `details` for plan-generator class names.
-        d = self.details
-        if "CompactionPlanGenerator" in d:
-            return "compactionPlan"
-        if "ClusteringPlanStrategy" in d or "ClusteringPlanActionExecutor" in d:
-            return "clusteringPlan"
+
+        Tried in order:
+          1. Pattern-match on stage `name` (cheap; works when Hudi sets a
+             descriptive name like 'tagLocation' / 'metadataRecordIndex').
+          2. Pattern-match on stage `details` call stack (works when Hudi
+             generates a generic stage name like
+             'collect at HoodieSparkEngineContext.java:160' but the call
+             stack carries the action-executor class).
+
+        Returns one of the labels listed in _PHASE_LABELS below, or
+        'unknown' if neither signal matched.
+        """
+        from_name = _phase_from_name(self.name)
+        if from_name is not None:
+            return from_name
+        from_details = _phase_from_details(self.details)
+        if from_details is not None:
+            return from_details
         return "unknown"
 
     @property
