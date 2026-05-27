@@ -390,6 +390,50 @@ KNOWN_ISSUES = {
             "rules.py with a higher severity than this catch-all."
         ),
     },
+    "clean-execute-unbatched-s3-deletes": {
+        "title": (
+            "Clean execution deletes files one-at-a-time (fs.isDirectory + "
+            "fs.delete per file) instead of bulk S3 DeleteObjects"
+        ),
+        "upstream": "internal (Hudi-side fix candidate; not yet filed upstream)",
+        "affected_versions": "any",
+        "severity": "high",
+        "description": (
+            "CleanActionExecutor.clean() -> deleteFilesFunc -> "
+            "deleteFileAndGetResult performs, PER FILE:\n"
+            "  1. fs.isDirectory(path)  — an S3 metadata round-trip (HEAD/LIST)\n"
+            "  2. fs.delete(path, ...)  — an S3 DELETE round-trip\n"
+            "i.e. two un-batched S3 calls per deleted file. Hudi never uses\n"
+            "S3's bulk DeleteObjects API (up to 1000 keys per call). File\n"
+            "deletion parallelism is capped at hoodie.cleaner.parallelism\n"
+            "(default 200), so a clean of N files serializes ~N/200 round-trip\n"
+            "PAIRS per Spark task.\n"
+            "\n"
+            "Deletes move no data, so the stage shows ZERO Spark-tracked I/O\n"
+            "bytes and very low CPU efficiency — it looks idle to Spark while\n"
+            "stalling on S3 latency. This is the throughput half of the\n"
+            "large-clean problem (the other half is the MDT commit exceeding\n"
+            "spark.rpc.message.maxSize — a separate failure mode).\n"
+            "\n"
+            "Observed in production at scale: a single clean covering on the\n"
+            "order of ~2M files across a few thousand partitions.\n"
+            "\n"
+            "Signature in Spark UI:\n"
+            "  - hudi_phase == cleanExecute (HoodieCleanActionExecutor in details)\n"
+            "  - numTasks >= 50 (up to hoodie.cleaner.parallelism)\n"
+            "  - cpu_efficiency < 10%\n"
+            "  - zero Spark-tracked I/O bytes\n"
+            "  - large summed executorRunTime (proxy for file volume)\n"
+        ),
+        "recommendation": (
+            "Operator mitigation (no code change): raise "
+            "hoodie.cleaner.parallelism above the default 200 to widen the "
+            "delete fan-out. Hudi-side fix: (a) batch deletions through S3 "
+            "DeleteObjects (1000 keys/call) instead of per-file fs.delete, and "
+            "(b) drop the per-file fs.isDirectory() probe — clean targets are "
+            "always files, so it is a pure wasted round-trip."
+        ),
+    },
 
     "r2-file-size-bloat": {
         "title": "Per-file metadata bloat — Hudi files carry ~440 KB extra per file",

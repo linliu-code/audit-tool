@@ -28,6 +28,7 @@ from rules import (  # noqa: E402
     rule_skew,
     rule_fetch_wait_dominates,
     rule_table_service_plan_per_partition_metadata_fetch,
+    rule_clean_execute_unbatched_deletes,
     rule_metadata_bound_stage,
 )
 
@@ -497,6 +498,84 @@ class TestMetadataBoundStageGeneric(unittest.TestCase):
             input_bytes=1,  # has Spark-tracked I/O
         )
         assert_filtered(self, rule_metadata_bound_stage, ctx, "has Spark-tracked I/O")
+
+
+class TestCleanExecuteUnbatchedDeletes(unittest.TestCase):
+    """Clean-execute stage doing per-file (isDirectory + delete) S3 round
+    trips instead of bulk DeleteObjects. Specialization of metadata_bound_stage
+    for hudi_phase=cleanExecute, severity-tiered by summed executor run time."""
+
+    # A clean-execute stack carries CleanActionExecutor (the real class).
+    CLEAN_DETAILS = (
+        "org.apache.spark.rdd.RDD.collect(RDD.scala:1030)\n"
+        "org.apache.hudi.table.action.clean.CleanActionExecutor.clean(CleanActionExecutor.java:151)\n"
+        "org.apache.hudi.table.action.clean.CleanActionExecutor.runClean(CleanActionExecutor.java:221)\n"
+    )
+
+    def _ctx(self, *, num_tasks=200, run_ms=3_600_000, cpu_ns=1_000_000_000,
+             io_input=0, details=None):
+        # cpu_ns default: 1s CPU on a multi-minute+ wall = far below 10%.
+        return make_ctx(
+            details=self.CLEAN_DETAILS if details is None else details,
+            num_tasks=num_tasks,
+            executor_run_time_ms=run_ms,
+            executor_cpu_time_ns=cpu_ns,
+            input_bytes=io_input,
+        )
+
+    # ── severity tiers ──────────────────────────────────────────────────
+    def test_high_on_large_summed_runtime(self):
+        # >= 1h summed executor time waiting on S3 round-trips
+        assert_fires(self, rule_clean_execute_unbatched_deletes,
+                     self._ctx(run_ms=3_600_000), "high")
+
+    def test_medium_on_moderate_runtime(self):
+        # 5 min - 1h
+        assert_fires(self, rule_clean_execute_unbatched_deletes,
+                     self._ctx(run_ms=600_000), "medium")
+
+    def test_low_on_small_but_nontrivial_runtime(self):
+        # 2s - 5 min
+        assert_fires(self, rule_clean_execute_unbatched_deletes,
+                     self._ctx(run_ms=60_000, cpu_ns=100_000_000), "low")
+
+    def test_phase_classifies_from_real_class_name(self):
+        # Guard the classifier change: the real class is CleanActionExecutor.
+        self.assertEqual(self._ctx().hudi_phase, "cleanExecute")
+
+    # ── filters ─────────────────────────────────────────────────────────
+    def test_filter_wrong_phase(self):
+        # No clean class in the stack → not cleanExecute
+        assert_filtered(self, rule_clean_execute_unbatched_deletes,
+                        self._ctx(details=""), "hudi_phase != cleanExecute")
+
+    def test_filter_below_task_floor(self):
+        assert_filtered(self, rule_clean_execute_unbatched_deletes,
+                        self._ctx(num_tasks=10), "num_tasks < 50")
+
+    def test_filter_below_wall_floor(self):
+        assert_filtered(self, rule_clean_execute_unbatched_deletes,
+                        self._ctx(run_ms=500), "duration < 2s")
+
+    def test_filter_when_cpu_efficiency_high(self):
+        # Real compute, not S3-bound: 1000s CPU on 3600s wall ≈ 28%
+        assert_filtered(self, rule_clean_execute_unbatched_deletes,
+                        self._ctx(run_ms=3_600_000, cpu_ns=1_000_000_000_000),
+                        "cpu_efficiency >= 10%")
+
+    def test_filter_when_stage_has_io_bytes(self):
+        # Deletes carry no data; any Spark-tracked I/O ⇒ not the delete fan-out
+        assert_filtered(self, rule_clean_execute_unbatched_deletes,
+                        self._ctx(io_input=1), "has Spark-tracked I/O")
+
+    # ── cross-rule: generic detector must defer to this specific rule ────
+    def test_metadata_bound_defers_on_clean_execute(self):
+        # The same firing signature must NOT also produce a metadata_bound
+        # finding (cleanExecute is in _SPECIFIC_PHASES_HANDLED_ELSEWHERE).
+        ctx = self._ctx(run_ms=3_600_000)
+        assert_fires(self, rule_clean_execute_unbatched_deletes, ctx, "high")
+        assert_filtered(self, rule_metadata_bound_stage, ctx,
+                        "covered by rule_clean_execute_unbatched_deletes")
 
 
 if __name__ == "__main__":

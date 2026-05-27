@@ -114,7 +114,10 @@ _DETAILS_CLASS_PATTERNS = [
     # ── Clean ───────────────────────────────────────────────────────────
     ("CleanPlanActionExecutor", "cleanPlan"),
     ("CleanPlanner", "cleanPlan"),
-    ("HoodieCleanActionExecutor", "cleanExecute"),
+    # Real clean-execute class is `CleanActionExecutor`; this substring also
+    # matches `HoodieCleanActionExecutor`. Plan patterns precede it above so a
+    # clean-PLAN stack still classifies as cleanPlan.
+    ("CleanActionExecutor", "cleanExecute"),
     # ── Rollback ────────────────────────────────────────────────────────
     ("BaseRollbackActionExecutor", "rollback"),
     ("BaseRollbackHelper", "rollback"),

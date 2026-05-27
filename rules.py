@@ -400,7 +400,7 @@ def rule_table_service_plan_per_partition_metadata_fetch(ctx: StageContext) -> O
 
 # Stage phases that already have a specific, more-actionable rule. Skip them
 # from the generic detector to avoid duplicate findings on the same stage.
-_SPECIFIC_PHASES_HANDLED_ELSEWHERE = ("compactionPlan", "clusteringPlan")
+_SPECIFIC_PHASES_HANDLED_ELSEWHERE = ("compactionPlan", "clusteringPlan", "cleanExecute")
 
 
 def rule_metadata_bound_stage(ctx: StageContext) -> Optional[Finding]:
@@ -461,6 +461,83 @@ def rule_metadata_bound_stage(ctx: StageContext) -> Optional[Finding]:
             "per-table catalog sync, archive scans. If you identify a specific "
             "code path that should batch its calls, file a follow-up and add a "
             "dedicated detection rule to rules.py."
+        ),
+    )
+
+
+def rule_clean_execute_unbatched_deletes(ctx: StageContext) -> Optional[Finding]:
+    """Clean execution stage spending ~all of its time on per-file S3 round
+    trips instead of bulk deletes.
+
+    `CleanActionExecutor.clean()` deletes files one at a time: for each file,
+    `deleteFileAndGetResult` calls `fs.isDirectory(path)` THEN
+    `fs.delete(path)` — two un-batched S3 round-trips per file — and never
+    uses S3's bulk `DeleteObjects` (1000 keys/call). Deletes carry no data, so
+    the stage registers zero Spark-tracked I/O bytes while burning executor
+    wall-time waiting on S3. Parallelism is capped at
+    `hoodie.cleaner.parallelism` (default 200), so a large clean serializes
+    ~files/200 round-trip pairs per task.
+
+    This is a specialization of `metadata_bound_stage` (same byte-less /
+    CPU-starved / fan-out signature) for the cleanExecute phase, promoted to
+    a named, severity-tiered finding because the fix shape is known. Because
+    "cleanExecute" is in `_SPECIFIC_PHASES_HANDLED_ELSEWHERE`, the generic
+    rule defers to this one (no duplicate finding).
+
+    Severity scales with summed executor run time — a proxy for delete volume,
+    since S3 call counts/latency are NOT in Spark's metric model and can only
+    be inferred from this negative signature.
+
+    Tunables mirror the generic detector's floors so coverage is identical
+    where they overlap:
+      - MIN_TASKS: genuine fan-out (clean caps at hoodie.cleaner.parallelism)
+      - MAX_CPU_EFFICIENCY: 0.10 = >90% of executor time spent waiting
+      - MIN_WALL_MS: ignore trivially short cleans
+    """
+    MIN_TASKS = 50
+    MAX_CPU_EFFICIENCY = 0.10
+    MIN_WALL_MS = 2_000
+    if ctx.hudi_phase != "cleanExecute":
+        return None
+    if ctx.num_tasks < MIN_TASKS:
+        return None
+    if ctx.duration_ms < MIN_WALL_MS:
+        return None
+    if ctx.has_any_io_bytes:
+        return None
+    if ctx.cpu_efficiency >= MAX_CPU_EFFICIENCY:
+        return None
+    # Tier by summed executor run time spent in the un-batched-delete stage.
+    if ctx.duration_ms >= 3_600_000:      # >= ~1h of summed executor wall-time
+        severity = "high"
+    elif ctx.duration_ms >= 300_000:      # 5 min - 1h
+        severity = "medium"
+    else:                                 # 2s - 5 min
+        severity = "low"
+    return Finding(
+        rule_id="clean_execute_unbatched_deletes",
+        severity=severity,
+        stage_id=ctx.stage_id,
+        evidence={
+            "hudi_phase": ctx.hudi_phase,
+            "num_tasks": ctx.num_tasks,
+            "executor_run_time_ms": ctx.duration_ms,
+            "executor_cpu_time_ms": ctx.executor_cpu_time_ns // 1_000_000,
+            "cpu_efficiency": round(ctx.cpu_efficiency, 4),
+            "input_bytes": ctx.input_bytes,
+            "shuffle_read_bytes": ctx.shuffle_read_bytes,
+        },
+        linked_issue="clean-execute-unbatched-s3-deletes",
+        recommendation=(
+            "The clean execution stage deletes files one at a time: per file "
+            "CleanActionExecutor.deleteFileAndGetResult calls fs.isDirectory() "
+            "then fs.delete() — two un-batched S3 round-trips per file — and "
+            "never uses S3 bulk DeleteObjects (1000 keys/call). With parallelism "
+            "capped at hoodie.cleaner.parallelism (default 200), a large clean "
+            "serializes ~files/200 round-trip pairs per task. Operator "
+            "mitigation: raise hoodie.cleaner.parallelism. Hudi-side fix: batch "
+            "deletes via S3 DeleteObjects and drop the redundant per-file "
+            "isDirectory() probe (clean targets are always files)."
         ),
     )
 
@@ -655,6 +732,7 @@ STAGE_RULES: List[Callable[[StageContext], Optional[Finding]]] = [
     rule_skew,
     rule_fetch_wait_dominates,
     rule_table_service_plan_per_partition_metadata_fetch,
+    rule_clean_execute_unbatched_deletes,
     rule_metadata_bound_stage,
 ]
 
